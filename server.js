@@ -91,7 +91,6 @@ app.get('/api/asset-prices', async (req, res) => {
         price = 0;
       }
 
-      // Se Yahoo fallisce, usa il valore di fallback per garantire continuità
       if (!Number.isFinite(price) || price <= 0) {
         price = asset.fallback;
       }
@@ -103,7 +102,6 @@ app.get('/api/asset-prices', async (req, res) => {
     cachedAt = Date.now();
     res.json(cachedQuotes);
   } catch (err) {
-    // Fallback di emergenza totale
     const quotes = {};
     for (const [key, asset] of Object.entries(yahooInstruments)) {
       quotes[key] = { price: asset.fallback, currency: "USD", instrument: asset.instrument, symbol: asset.symbol };
