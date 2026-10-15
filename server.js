@@ -48,10 +48,11 @@ function saveDatabase() {
   }
 }
 
-// Configurazione asset Yahoo Finance
+// Configurazione completa degli asset per allineare il frontend
 const yahooInstruments = {
   gold: { symbol: "GC=F", instrument: "Gold futures" },
   oil: { symbol: "CL=F", instrument: "WTI crude futures" },
+  electricity: { symbol: "CL=F", instrument: "Energy" },
   sp500: { symbol: "^GSPC", instrument: "S&P 500 index" },
   nasdaq: { symbol: "^IXIC", instrument: "NASDAQ Composite" },
   tesla: { symbol: "TSLA", instrument: "Tesla stock" }
