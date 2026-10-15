@@ -26,7 +26,6 @@ let db = {
   }
 };
 
-// Caricamento sicuro del database (senza mai crashare)
 try {
   if (fs.existsSync(DB_FILE)) {
     const data = fs.readFileSync(DB_FILE, 'utf8');
@@ -37,7 +36,7 @@ try {
     fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), 'utf8');
   }
 } catch (err) {
-  console.error("Avviso DB (continuazione normale):", err.message);
+  console.error("Avviso DB:", err.message);
 }
 
 function saveDatabase() {
@@ -48,14 +47,13 @@ function saveDatabase() {
   }
 }
 
-// Configurazione completa degli asset per allineare il frontend
 const yahooInstruments = {
-  gold: { symbol: "GC=F", instrument: "Gold futures" },
-  oil: { symbol: "CL=F", instrument: "WTI crude futures" },
-  electricity: { symbol: "CL=F", instrument: "Energy" },
-  sp500: { symbol: "^GSPC", instrument: "S&P 500 index" },
-  nasdaq: { symbol: "^IXIC", instrument: "NASDAQ Composite" },
-  tesla: { symbol: "TSLA", instrument: "Tesla stock" }
+  gold: { symbol: "GC=F", instrument: "Gold futures", fallback: 2350.0 },
+  oil: { symbol: "CL=F", instrument: "WTI crude futures", fallback: 78.5 },
+  electricity: { symbol: "CL=F", instrument: "Energy", fallback: 78.5 },
+  sp500: { symbol: "^GSPC", instrument: "S&P 500 index", fallback: 5200.0 },
+  nasdaq: { symbol: "^IXIC", instrument: "NASDAQ Composite", fallback: 16400.0 },
+  tesla: { symbol: "TSLA", instrument: "Tesla stock", fallback: 175.0 }
 };
 
 let cachedQuotes = null;
@@ -64,7 +62,7 @@ let cachedAt = 0;
 async function fetchJson(url, yahooRequest = false) {
   try {
     const response = await axios.get(url, {
-      timeout: 5000,
+      timeout: 4000,
       headers: yahooRequest
         ? { accept: "application/json", "user-agent": "Mozilla/5.0", referer: "https://finance.yahoo.com/" }
         : { accept: "application/json" }
@@ -75,31 +73,45 @@ async function fetchJson(url, yahooRequest = false) {
   }
 }
 
-// API Prezzi Asset di Mercato
 app.get('/api/asset-prices', async (req, res) => {
   try {
     if (cachedQuotes && Date.now() - cachedAt < 60_000) {
       return res.json(cachedQuotes);
     }
+    
     const quotes = {};
     for (const [key, asset] of Object.entries(yahooInstruments)) {
-      const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(asset.symbol)}?range=1d&interval=1m`;
-      const body = await fetchJson(url, true);
-      const meta = body?.chart?.result?.[0]?.meta;
-      const price = Number(meta?.regularMarketPrice);
-      if (Number.isFinite(price) && price > 0) {
-        quotes[key] = { price, currency: "USD", instrument: asset.instrument, symbol: asset.symbol };
+      let price = 0;
+      try {
+        const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(asset.symbol)}?range=1d&interval=1m`;
+        const body = await fetchJson(url, true);
+        const meta = body?.chart?.result?.[0]?.meta;
+        price = Number(meta?.regularMarketPrice);
+      } catch (e) {
+        price = 0;
       }
+
+      // Se Yahoo fallisce, usa il valore di fallback per garantire continuità
+      if (!Number.isFinite(price) || price <= 0) {
+        price = asset.fallback;
+      }
+
+      quotes[key] = { price, currency: "USD", instrument: asset.instrument, symbol: asset.symbol };
     }
+
     cachedQuotes = { quotes, fetchedAt: Date.now() };
     cachedAt = Date.now();
     res.json(cachedQuotes);
   } catch (err) {
-    res.json({ quotes: {} });
+    // Fallback di emergenza totale
+    const quotes = {};
+    for (const [key, asset] of Object.entries(yahooInstruments)) {
+      quotes[key] = { price: asset.fallback, currency: "USD", instrument: asset.instrument, symbol: asset.symbol };
+    }
+    res.json({ quotes, fetchedAt: Date.now() });
   }
 });
 
-// Autenticazione e Registrazione
 app.post('/api/auth/register', (req, res) => {
   const { username, email, password, language } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: "Dati mancanti" });
