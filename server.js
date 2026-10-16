@@ -1,423 +1,399 @@
-const yahooInstruments = {
-  gold: { symbol: "GC=F", instrument: "Gold futures · USD per troy ounce" },
-  oil: { symbol: "CL=F", instrument: "WTI crude futures · USD per barrel" },
-  sp500: { symbol: "^GSPC", instrument: "S&P 500 index · index points" },
-  nasdaq: { symbol: "^IXIC", instrument: "NASDAQ Composite · index points" },
-  tesla: { symbol: "TSLA", instrument: "Tesla common stock · USD per share" },
-  artificialIntelligence: { symbol: "AIQ", instrument: "Global X AI & Technology ETF · USD per share" },
+import crypto from 'node:crypto';
+import { promisify } from 'node:util';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import express from 'express';
+import pg from 'pg';
+
+const { Pool } = pg;
+const scrypt = promisify(crypto.scrypt);
+const app = express();
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.PGSSLMODE === 'disable' ? false : { rejectUnauthorized: false },
+  max: 10,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 10_000,
+});
+const port = Number(process.env.PORT || 3000);
+const sessionHours = Math.max(1, Math.min(720, Number(process.env.SESSION_TTL_HOURS) || 168));
+const networks = {
+  bep20: { asset: 'BNB', label: 'BNB · BNB Smart Chain', env: 'DEPOSIT_ADDRESS_BNB_BEP20' },
+  trc20: { asset: 'USDT', label: 'USDT · TRON TRC-20', env: 'DEPOSIT_ADDRESS_USDT_TRC20' },
+  bitcoin: { asset: 'BTC', label: 'BTC · Bitcoin', env: 'DEPOSIT_ADDRESS_BTC' },
 };
+const now = () => Date.now();
+const id = () => crypto.randomUUID();
+const hashToken = (token) => crypto.createHash('sha256').update(token).digest('hex');
+const json = (res, data, status = 200) => res.status(status).json(data);
+const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const authAttempts = new Map();
 
-let cachedQuotes = null;
-let cachedAt = 0;
-let refreshInFlight = null;
-let cachedHistory = null;
-let historyAt = 0;
-let historyInFlight = null;
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '32kb' }));
 
-async function fetchJson(url, yahooRequest = false) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 8000);
-  try {
-    const response = await fetch(url, {
-      headers: yahooRequest
-        ? { accept: "application/json", "user-agent": "Mozilla/5.0 (compatible; YouInvestMarket/1.0)", referer: "https://finance.yahoo.com/" }
-        : { accept: "application/json" },
-      signal: controller.signal,
-    });
-    if (!response.ok) return null;
-    return await response.json();
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-async function yahooQuote(key, asset) {
-  const url = "https://query2.finance.yahoo.com/v8/finance/chart/" + encodeURIComponent(asset.symbol) + "?range=1d&interval=1m";
-  const body = await fetchJson(url, true);
-  const result = body?.chart?.result?.[0];
-  const meta = result?.meta;
-  const price = Number(meta?.regularMarketPrice);
-  if (!Number.isFinite(price) || price <= 0) return null;
-  const chartTime = result?.timestamp?.at(-1);
-  const marketAt = Number(meta?.regularMarketTime || chartTime) * 1000;
+function baseAccount({ id: accountId, username, email, role = 'user', createdAt = now(), data = {} }) {
   return {
-    price,
-    currency: key === "sp500" || key === "nasdaq" ? "" : "USD",
-    unit: key === "sp500" || key === "nasdaq" ? "index points" : "",
-    instrument: asset.instrument,
-    symbol: asset.symbol,
-    provider: "Yahoo Finance",
-    marketAt: Number.isFinite(marketAt) ? marketAt : Date.now(),
+    id: accountId, username, email, role, status: 'approved', createdAt, revision: 1,
+    wallet: { deposit: 0, earnings: 0 }, investments: [], transactions: [],
+    depositRequests: [], withdrawalRequests: [], preferences: { language: 'en', theme: 'dark' },
+    withdrawalWallet: null, walletChangeRequests: [], withdrawalPinSet: false,
+    h9Points: 0, bonusSpins: 0, pointHistory: [], referralCode: accountId.slice(-7).toUpperCase(),
+    referrals: [], activeBonuses: [], rewardRedemptions: [], dailyPrizes: [],
+    ...data,
   };
 }
 
-async function cryptoQuotes(now) {
-  const body = await fetchJson("https://api.kraken.com/0/public/Ticker?pair=XBTUSD,ETHUSD");
-  const result = body?.result;
-  if (body?.error?.length || !result) return {};
-  const quotes = {};
-  for (const [key, ticker, instrument, symbol] of [
-    ["bitcoin", "XXBTZUSD", "Bitcoin spot · USD per BTC", "BTC/USD"],
-    ["ethereum", "XETHZUSD", "Ethereum spot · USD per ETH", "ETH/USD"],
-  ]) {
-    const price = Number(result[ticker]?.c?.[0]);
-    if (!Number.isFinite(price) || price <= 0) continue;
-    quotes[key] = {
-      price, currency: "USD", unit: "", instrument, symbol,
-      provider: "Kraken", marketAt: now,
-    };
-  }
-  return quotes;
+async function passwordHash(password, salt = crypto.randomBytes(16).toString('hex')) {
+  const derived = await scrypt(password, salt, 64);
+  return { salt, hash: derived.toString('hex') };
 }
 
-async function electricityQuote(now) {
-  const start = new Date(now - 72 * 60 * 60 * 1000).toISOString();
-  const end = new Date(now).toISOString();
-  const params = new URLSearchParams({ bzn: "DE-LU", start, end });
-  const body = await fetchJson("https://api.energy-charts.info/price?" + params);
-  if (!Array.isArray(body?.unix_seconds) || !Array.isArray(body?.price)) return null;
-  let latest = -1;
-  for (let i = 0; i < body.unix_seconds.length; i += 1) {
-    const timestamp = Number(body.unix_seconds[i]) * 1000;
-    const price = Number(body.price[i]);
-    if (Number.isFinite(timestamp) && timestamp <= now && Number.isFinite(price) && timestamp > latest) latest = timestamp;
-  }
-  if (latest < 0) return null;
-  const index = body.unix_seconds.findIndex((timestamp) => Number(timestamp) * 1000 === latest);
+async function passwordMatches(password, salt, storedHash) {
+  if (!salt || !storedHash) return false;
+  const derived = await scrypt(password, salt, 64);
+  const expected = Buffer.from(storedHash, 'hex');
+  return expected.length === derived.length && crypto.timingSafeEqual(derived, expected);
+}
+
+function publicAccount(row, depositRequests = []) {
+  const data = row.account_data || {};
   return {
-    price: Number(body.price[index]),
-    currency: "EUR",
-    unit: "per MWh",
-    instrument: "DE-LU day-ahead electricity · wholesale market",
-    symbol: "DE-LU",
-    provider: "Energy-Charts · Bundesnetzagentur",
-    marketAt: latest,
+    ...data,
+    id: row.id,
+    username: row.username,
+    email: row.email,
+    role: row.role,
+    status: row.status,
+    createdAt: Number(row.created_at),
+    revision: Number(row.revision),
+    depositRequests,
+    withdrawalRequests: data.withdrawalRequests || [],
+    withdrawalPinSet: Boolean(data.withdrawalPinSet),
   };
 }
 
+function depositView(row) {
+  return {
+    id: row.id,
+    amount: Number(row.amount),
+    amountCurrency: row.amount_currency || 'crypto',
+    asset: row.asset,
+    network: row.network,
+    depositAddress: row.deposit_address,
+    txHash: row.tx_hash,
+    status: row.status,
+    creditUsdt: row.credit_usdt == null ? null : Number(row.credit_usdt),
+    createdAt: Number(row.created_at),
+    reviewedAt: row.reviewed_at == null ? null : Number(row.reviewed_at),
+    transactionId: row.transaction_id,
+  };
+}
 
-async function yahooHistory(asset) {
-  const body = await fetchJson(
-    "https://query2.finance.yahoo.com/v8/finance/chart/" + encodeURIComponent(asset.symbol) + "?range=1d&interval=1m",
-    true,
+async function getAccount(row) {
+  const { rows } = await pool.query(
+    'SELECT * FROM deposit_requests WHERE account_id = $1 ORDER BY created_at DESC LIMIT 100',
+    [row.id],
   );
-  const result = body?.chart?.result?.[0];
-  const timestamps = result?.timestamp || [];
-  const closes = result?.indicators?.quote?.[0]?.close || [];
-  const points = timestamps.flatMap((timestamp, index) => {
-    const value = Number(closes[index]);
-    return Number.isFinite(value) && value > 0
-      ? [{ time: Number(timestamp) * 1000, value }]
-      : [];
-  });
-  return points.filter((point, index) => index % 15 === 0 || index === points.length - 1);
+  return publicAccount(row, rows.map(depositView));
 }
 
-function electricityHistory(body, since) {
-  return (body?.unix_seconds || []).flatMap((seconds, index) => {
-    const time = Number(seconds) * 1000;
-    const value = Number(body.price[index]);
-    return Number.isFinite(time) && time >= since * 1000 && Number.isFinite(value)
-      ? [{ time, value }]
-      : [];
-  });
+function requireAuth(req, res, next) {
+  const token = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  if (!token || token.length > 256) return json(res, { error: 'Sign in to continue.' }, 401);
+  pool.query(
+    'SELECT a.*, s.expires_at FROM app_sessions s JOIN app_accounts a ON a.id = s.account_id WHERE s.token_hash = $1 AND s.expires_at > NOW()',
+    [hashToken(token)],
+  ).then(({ rows }) => {
+    if (!rows[0] || rows[0].status !== 'approved') return json(res, { error: 'Session expired. Please log in again.' }, 401);
+    req.account = rows[0];
+    next();
+  }).catch(next);
 }
 
-async function loadAssetHistory() {
-  const now = Date.now();
-  const since = Math.floor((now - 24 * 60 * 60 * 1000) / 1000);
-  const electricityParams = new URLSearchParams({
-    bzn: "DE-LU",
-    start: new Date(now - 72 * 60 * 60 * 1000).toISOString(),
-    end: new Date(now).toISOString(),
-  });
-  const [yahooEntries, bitcoinBody, ethereumBody, bitcoinYahoo, ethereumYahoo, electricityBody] = await Promise.all([
-    Promise.all(Object.entries(yahooInstruments).map(async ([key, asset]) => [key, await yahooHistory(asset)])),
-    fetchJson("https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=30&since=" + since),
-    fetchJson("https://api.kraken.com/0/public/OHLC?pair=ETHUSD&interval=30&since=" + since),
-    yahooHistory({ symbol: "BTC-USD" }),
-    yahooHistory({ symbol: "ETH-USD" }),
-    fetchJson("https://api.energy-charts.info/price?" + electricityParams),
-  ]);
-  const histories = Object.fromEntries(yahooEntries.filter(([, points]) => points.length));
-  for (const [key, body, fallback] of [["bitcoin", bitcoinBody, bitcoinYahoo], ["ethereum", ethereumBody, ethereumYahoo]]) {
-    const result = body?.result || {};
-    const ticker = Object.keys(result).find((name) => name !== "last");
-    const points = (ticker ? result[ticker] : []).flatMap((row) => {
-      const value = Number(row[4]);
-      return Number.isFinite(value) && value > 0 ? [{ time: Number(row[0]) * 1000, value }] : [];
-    });
-    const fallbackPoints = fallback.filter((point) => Number.isFinite(point.value) && point.value > 0);
-    if (points.length) histories[key] = points;
-    else if (fallbackPoints.length) histories[key] = fallbackPoints;
+function requireAdmin(req, res, next) {
+  if (req.account?.role !== 'admin') return json(res, { error: 'Not authorized.' }, 403);
+  next();
+}
+
+function authRateLimit(req, res, next) {
+  const key = req.ip || 'unknown';
+  const entry = authAttempts.get(key) || { count: 0, resetAt: now() + 15 * 60_000 };
+  if (entry.resetAt <= now()) { entry.count = 0; entry.resetAt = now() + 15 * 60_000; }
+  entry.count += 1;
+  if (authAttempts.size > 10_000) {
+    for (const [ip, attempt] of authAttempts) if (attempt.resetAt <= now()) authAttempts.delete(ip);
   }
-  const electricity = electricityHistory(electricityBody, since);
-  if (electricity.length) histories.electricity = electricity;
-  return { histories, fetchedAt: Date.now() };
+  authAttempts.set(key, entry);
+  if (entry.count > 30) return json(res, { error: 'Too many attempts. Try again later.' }, 429);
+  next();
 }
 
-async function loadQuotes() {
-  const now = Date.now();
-  const [entries, crypto, electricity] = await Promise.all([
-    Promise.all(Object.entries(yahooInstruments).map(async ([key, asset]) => [key, await yahooQuote(key, asset)])),
-    cryptoQuotes(now),
-    electricityQuote(now),
-  ]);
-  const quotes = Object.fromEntries(entries.filter(([, quote]) => quote));
-  Object.assign(quotes, crypto);
-  if (electricity) quotes.electricity = electricity;
-  return { quotes, fetchedAt: Date.now() };
+function safeTxHash(network, value) {
+  const hash = String(value || '').trim();
+  if (network === 'bep20') return /^0x[a-fA-F0-9]{64}$/.test(hash) ? hash.toLowerCase() : '';
+  return /^[a-fA-F0-9]{64}$/.test(hash) ? hash.toLowerCase() : '';
 }
 
-const websimAccountSchema = "CREATE TABLE IF NOT EXISTS websim_app_accounts (id TEXT PRIMARY KEY, user_id TEXT NOT NULL, email TEXT NOT NULL UNIQUE, username TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('user','admin')), status TEXT NOT NULL DEFAULT 'approved', salt TEXT NOT NULL, password_hash TEXT NOT NULL, account_json TEXT NOT NULL, created_at INTEGER NOT NULL, revision INTEGER NOT NULL DEFAULT 1); CREATE INDEX IF NOT EXISTS websim_app_accounts_user ON websim_app_accounts(user_id); CREATE UNIQUE INDEX IF NOT EXISTS websim_app_username_lower ON websim_app_accounts(LOWER(username)); CREATE TABLE IF NOT EXISTS websim_app_sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL, account_id TEXT NOT NULL REFERENCES websim_app_accounts(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL); CREATE INDEX IF NOT EXISTS websim_app_sessions_account ON websim_app_sessions(account_id); CREATE TABLE IF NOT EXISTS websim_app_recovery (account_id TEXT PRIMARY KEY REFERENCES websim_app_accounts(id) ON DELETE CASCADE, user_id TEXT NOT NULL, recovery_salt TEXT NOT NULL, recovery_hash TEXT NOT NULL, issued_by TEXT NOT NULL, reset_salt TEXT, reset_hash TEXT, reset_expires_at INTEGER)";
-export const schema = websimAccountSchema;
-const adminEmail = "h9invest@gmail.com";
-const accountId = () => crypto.randomUUID();
-const hex = (bytes) => [...bytes].map((part) => part.toString(16).padStart(2, "0")).join("");
-const safeEqual = (left, right) => {
-  if (typeof left !== "string" || typeof right !== "string" || left.length !== right.length) return false;
-  let mismatch = 0;
-  for (let index = 0; index < left.length; index += 1) mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);
-  return mismatch === 0;
-};
-async function appPasswordHash(password, salt) {
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
-  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: 120000, hash: "SHA-256" }, key, 256);
-  return hex(new Uint8Array(bits));
+function getDepositAddresses() {
+  return Object.fromEntries(Object.entries(networks).map(([key, config]) => [key, String(process.env[config.env] || '').trim()]));
 }
-async function appTokenHash(token) {
-  return hex(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(token))));
-}
-function baseAppAccount({ id, userId, username, email, role = "user", language = "en" }) {
-  return {
-    id, username, email, role, status: "approved", createdAt: Date.now(), revision: 1,
-    wallet: { deposit: 0, earnings: 0 }, investments: [], transactions: [], depositRequests: [], withdrawalRequests: [],
-    preferences: { language, theme: "dark" }, withdrawalWallet: null, walletChangeRequests: [], withdrawalPinSet: false,
-    h9Points: 0, bonusSpins: 0, pointHistory: [], referralCode: id.slice(-7).toUpperCase(), referrals: [],
-    activeBonuses: [], rewardRedemptions: [], dailyPrizes: [],
-  };
-}
-function appPublicAccount(row) {
-  let data = {};
-  try { data = JSON.parse(row.account_json || "{}"); } catch {}
-  return { ...data, id: row.id, username: row.username, email: row.email, role: row.role, status: row.status, createdAt: Number(row.created_at), revision: Number(row.revision) };
-}
-function appJson(data, status = 200) {
-  return Response.json(data, { status, headers: { "Cache-Control": "no-store" } });
-}
-async function appAuth(request, env) {
-  const userId = request.headers.get("x-websim-user-id");
-  const token = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
-  if (!userId || !token || token.length > 256) return { response: appJson({ error: "Sign in to continue." }, 401) };
-  const row = await env.DB.prepare("SELECT a.*, s.expires_at FROM websim_app_sessions s JOIN websim_app_accounts a ON a.id=s.account_id WHERE s.token_hash=? AND s.user_id=? AND s.expires_at>? LIMIT 1")
-    .bind(await appTokenHash(token), userId, Date.now()).first();
-  if (!row) return { response: appJson({ error: "Session expired. Please log in again." }, 401) };
-  return { userId, row };
-}
-async function appStartSession(env, row, userId) {
-  const token = hex(crypto.getRandomValues(new Uint8Array(32)));
-  await env.DB.prepare("INSERT INTO websim_app_sessions (token_hash,user_id,account_id,expires_at) VALUES (?,?,?,?)")
-    .bind(await appTokenHash(token), userId, row.id, Date.now() + 30 * 86400000).run();
-  return { token, account: appPublicAccount(row) };
-}
-async function appAccountApi(request, env, url) {
-  if (!url.pathname.startsWith("/api/app/")) return null;
+
+app.post('/api/auth/register', authRateLimit, async (req, res, next) => {
   try {
-    const method = request.method;
-    const path = url.pathname;
-    const userId = request.headers.get("x-websim-user-id");
-    const ownerId = request.headers.get("x-websim-project-owner-id");
-    const owner = Boolean(userId && ownerId && userId === ownerId);
-    const body = ["POST", "PUT", "PATCH"].includes(method) ? await request.json().catch(() => ({})) : {};
-    if (path === "/api/app/auth/password-reset/request" && method === "POST") {
-      if (!userId) return appJson({ error: "Sign in to WebSIM before resetting a password." }, 401);
-      const email = String(body.email || "").trim().toLowerCase();
-      const recoveryCode = String(body.recoveryCode || "").replace(/\s/g, "").toUpperCase();
-      const row = await env.DB.prepare("SELECT a.id,a.user_id,r.recovery_salt,r.recovery_hash FROM websim_app_accounts a JOIN websim_app_recovery r ON r.account_id=a.id WHERE a.email=? AND a.user_id=? LIMIT 1").bind(email, userId).first();
-      if (!row || !safeEqual(await appPasswordHash(recoveryCode, row.recovery_salt), row.recovery_hash)) return appJson({ error: "Email or recovery key is incorrect. Request an admin-issued key from support." }, 401);
-      const token = hex(crypto.getRandomValues(new Uint8Array(32)));
-      const resetSalt = hex(crypto.getRandomValues(new Uint8Array(16)));
-      await env.DB.prepare("UPDATE websim_app_recovery SET reset_salt=?,reset_hash=?,reset_expires_at=? WHERE account_id=?").bind(resetSalt, await appPasswordHash(token, resetSalt), Date.now() + 900000, row.id).run();
-      return appJson({ token });
+    const username = String(req.body?.username || '').trim();
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    const adminEmail = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+    if (username.length < 3 || username.length > 30 || !emailPattern.test(email) || password.length < 12 || password.length > 200) {
+      return json(res, { error: 'Use a valid username and email, and a password of at least 12 characters.' }, 400);
     }
-    if (path === "/api/app/auth/password-reset/confirm" && method === "POST") {
-      if (!userId) return appJson({ error: "Sign in to WebSIM before resetting a password." }, 401);
-      const token = String(body.token || "");
-      const password = String(body.password || "");
-      if (password.length < 8 || password.length > 200) return appJson({ error: "New password must contain at least 8 characters." }, 400);
-      const { results } = await env.DB.prepare("SELECT a.id,r.reset_salt,r.reset_hash,r.reset_expires_at FROM websim_app_accounts a JOIN websim_app_recovery r ON r.account_id=a.id WHERE a.user_id=? AND r.reset_expires_at>?").bind(userId, Date.now()).all();
-      let target = null;
-      for (const row of results) if (safeEqual(await appPasswordHash(token, row.reset_salt), row.reset_hash)) { target = row; break; }
-      if (!target) return appJson({ error: "This password reset has expired or was already used. Verify your recovery key and try again." }, 400);
-      const salt = hex(crypto.getRandomValues(new Uint8Array(16)));
-      await env.DB.batch([
-        env.DB.prepare("UPDATE websim_app_accounts SET salt=?,password_hash=? WHERE id=?").bind(salt, await appPasswordHash(password, salt), target.id),
-        env.DB.prepare("DELETE FROM websim_app_sessions WHERE account_id=?").bind(target.id),
-        env.DB.prepare("UPDATE websim_app_recovery SET reset_salt=NULL,reset_hash=NULL,reset_expires_at=NULL WHERE account_id=?").bind(target.id),
-      ]);
-      return appJson({ ok: true });
-    }
-    if (path === "/api/app/auth/register" && method === "POST") {
-      if (!userId) return appJson({ error: "Sign in to WebSIM before creating an account." }, 401);
-      const username = String(body.username || "").trim();
-      const email = String(body.email || "").trim().toLowerCase();
-      const password = String(body.password || "");
-      const language = ["en", "fr", "es", "de", "pt", "hi", "zh", "it"].includes(body.language) ? body.language : "en";
-      if (username.length < 3 || username.length > 30 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 8 || password.length > 200) return appJson({ error: "Check your username, email and password (at least 8 characters)." }, 400);
-      if (email === adminEmail) return appJson({ error: "This email is reserved." }, 409);
-      const id = accountId();
-      const salt = hex(crypto.getRandomValues(new Uint8Array(16)));
-      const account = baseAppAccount({ id, userId, username, email, language });
-      try {
-        const result = await env.DB.prepare("INSERT INTO websim_app_accounts (id,user_id,email,username,role,status,salt,password_hash,account_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
-          .bind(id, userId, email, username, "user", "approved", salt, await appPasswordHash(password, salt), JSON.stringify(account), account.createdAt).run();
-        if (!result.meta.changes) return appJson({ error: "Email or username is already in use." }, 409);
-      } catch {
-        return appJson({ error: "Email or username is already in use." }, 409);
-      }
-      const row = await env.DB.prepare("SELECT * FROM websim_app_accounts WHERE id=?").bind(id).first();
-      return appJson(await appStartSession(env, row, userId), 201);
-    }
-    if (path === "/api/app/auth/login" && method === "POST") {
-      if (!userId) return appJson({ error: "Sign in to WebSIM before logging in." }, 401);
-      const email = String(body.email || "").trim().toLowerCase();
-      const password = String(body.password || "");
-      if (!email || !password || password.length > 200) return appJson({ error: "Email or password is incorrect." }, 401);
-      let row = await env.DB.prepare("SELECT * FROM websim_app_accounts WHERE email=? LIMIT 1").bind(email).first();
-      if (email === adminEmail && password === adminEmail && owner) {
-        if (row && (row.role !== "admin" || row.user_id !== userId)) return appJson({ error: "Admin account configuration conflict." }, 503);
-        if (!row) {
-          const id = accountId();
-          const salt = hex(crypto.getRandomValues(new Uint8Array(16)));
-          const account = baseAppAccount({ id, userId, username: "Admin-" + id.slice(0, 8), email, role: "admin" });
-          await env.DB.prepare("INSERT INTO websim_app_accounts (id,user_id,email,username,role,status,salt,password_hash,account_json,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
-            .bind(id, userId, email, account.username, "admin", "approved", salt, await appPasswordHash(password, salt), JSON.stringify(account), account.createdAt).run();
-          row = await env.DB.prepare("SELECT * FROM websim_app_accounts WHERE id=?").bind(id).first();
-        } else if (!safeEqual(await appPasswordHash(password, row.salt), row.password_hash)) {
-          return appJson({ error: "Email or password is incorrect." }, 401);
-        }
-      } else if (!row || row.user_id !== userId || row.role === "admin" || !safeEqual(await appPasswordHash(password, row.salt), row.password_hash)) {
-        return appJson({ error: "Email or password is incorrect." }, 401);
-      }
-      if (row.status !== "approved") return appJson({ error: "This account is not active." }, 403);
-      return appJson(await appStartSession(env, row, userId));
-    }
-    if (path === "/api/app/auth/logout" && method === "POST") {
-      const auth = await appAuth(request, env);
-      if (auth.response) return auth.response;
-      const token = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
-      await env.DB.prepare("DELETE FROM websim_app_sessions WHERE token_hash=?").bind(await appTokenHash(token)).run();
-      return appJson({ ok: true });
-    }
-    const auth = await appAuth(request, env);
-    if (auth.response) return auth.response;
-    const ownAccount = appPublicAccount(auth.row);
-    if (path === "/api/app/account" && method === "GET") return appJson({ account: ownAccount });
-    if (path === "/api/app/auth/password" && method === "PUT") {
-      const currentPassword = String(body.currentPassword || "");
-      const newPassword = String(body.newPassword || "");
-      if (newPassword.length < 8 || newPassword.length > 200 || !safeEqual(await appPasswordHash(currentPassword, auth.row.salt), auth.row.password_hash)) return appJson({ error: "Current password is incorrect or the new password is invalid." }, 400);
-      const salt = hex(crypto.getRandomValues(new Uint8Array(16)));
-      await env.DB.prepare("UPDATE websim_app_accounts SET salt=?,password_hash=? WHERE id=?").bind(salt, await appPasswordHash(newPassword, salt), auth.row.id).run();
-      return appJson({ account: ownAccount });
-    }
-    if (path === "/api/app/account" && method === "PUT") {
-      const incoming = body.account && typeof body.account === "object" ? body.account : body;
-      const expectedRevision = Number(body.expectedRevision ?? incoming.revision);
-      if (expectedRevision !== Number(auth.row.revision)) return appJson({ error: "Account changed in another browser. Refresh and try again." }, 409);
-      const protectedKeys = new Set(["id", "email", "username", "role", "status", "createdAt", "revision", "salt", "passwordHash", "platformAdmin"]);
-      const data = JSON.parse(auth.row.account_json || "{}");
-      for (const [key, value] of Object.entries(incoming)) if (!protectedKeys.has(key)) data[key] = value;
-      const result = await env.DB.prepare("UPDATE websim_app_accounts SET account_json=?,revision=revision+1 WHERE id=? AND revision=?")
-        .bind(JSON.stringify(data), auth.row.id, expectedRevision).run();
-      if (!result.meta.changes) return appJson({ error: "Account changed in another browser. Refresh and try again." }, 409);
-      const updated = await env.DB.prepare("SELECT * FROM websim_app_accounts WHERE id=?").bind(auth.row.id).first();
-      return appJson({ account: appPublicAccount(updated) });
-    }
-    if (path === "/api/app/admin/recovery-key" && method === "POST") {
-      if (auth.row.role !== "admin" || !owner) return appJson({ error: "Not authorized." }, 403);
-      const email = String(body.email || "").trim().toLowerCase();
-      const target = await env.DB.prepare("SELECT * FROM websim_app_accounts WHERE email=? LIMIT 1").bind(email).first();
-      if (!target) return appJson({ error: "No registered account was found." }, 404);
-      const recoveryCode = hex(crypto.getRandomValues(new Uint8Array(24))).toUpperCase();
-      const salt = hex(crypto.getRandomValues(new Uint8Array(16)));
-      await env.DB.prepare("INSERT INTO websim_app_recovery (account_id,user_id,recovery_salt,recovery_hash,issued_by) VALUES (?,?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET user_id=excluded.user_id,recovery_salt=excluded.recovery_salt,recovery_hash=excluded.recovery_hash,issued_by=excluded.issued_by,reset_salt=NULL,reset_hash=NULL,reset_expires_at=NULL")
-        .bind(target.id, target.user_id, salt, await appPasswordHash(recoveryCode, salt), auth.row.id).run();
-      return appJson({ account: appPublicAccount(target), recoveryCode });
-    }
-    if (path === "/api/app/admin/accounts" && method === "GET") {
-      if (auth.row.role !== "admin" || !owner) return appJson({ error: "Not authorized." }, 403);
-      const { results } = await env.DB.prepare("SELECT * FROM websim_app_accounts ORDER BY created_at DESC LIMIT 500").all();
-      return appJson({ accounts: results.map(appPublicAccount) });
-    }
-    if (path === "/api/app/admin/account" && method === "PUT") {
-      if (auth.row.role !== "admin" || !owner) return appJson({ error: "Not authorized." }, 403);
-      const incoming = body.account && typeof body.account === "object" ? body.account : body;
-      const targetId = String(incoming.id || body.id || "");
-      const target = await env.DB.prepare("SELECT * FROM websim_app_accounts WHERE id=?").bind(targetId).first();
-      if (!target) return appJson({ error: "Account not found." }, 404);
-      const expectedRevision = Number(body.expectedRevision ?? incoming.revision);
-      if (expectedRevision !== Number(target.revision)) return appJson({ error: "Account changed in another browser. Refresh and try again." }, 409);
-      const data = JSON.parse(target.account_json || "{}");
-      const protectedKeys = new Set(["id", "email", "username", "role", "status", "createdAt", "revision", "salt", "passwordHash", "platformAdmin"]);
-      for (const [key, value] of Object.entries(incoming)) if (!protectedKeys.has(key)) data[key] = value;
-      const status = ["approved", "blocked", "pending", "rejected"].includes(incoming.status) ? incoming.status : target.status;
-      const result = await env.DB.prepare("UPDATE websim_app_accounts SET account_json=?,status=?,revision=revision+1 WHERE id=? AND revision=?")
-        .bind(JSON.stringify(data), status, targetId, expectedRevision).run();
-      if (!result.meta.changes) return appJson({ error: "Account changed in another browser. Refresh and try again." }, 409);
-      const updated = await env.DB.prepare("SELECT * FROM websim_app_accounts WHERE id=?").bind(targetId).first();
-      return appJson({ account: appPublicAccount(updated) });
-    }
-    if (path === "/api/app/admin/accounts" && method === "DELETE") {
-      if (auth.row.role !== "admin" || !owner) return appJson({ error: "Not authorized." }, 403);
-      await env.DB.prepare("DELETE FROM websim_app_accounts WHERE role='user'").run();
-      return appJson({ ok: true });
-    }
-    return appJson({ error: "Not found." }, 404);
+    if (!process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD_SALT || !process.env.ADMIN_PASSWORD_HASH) return json(res, { error: 'Service admin is not configured.' }, 503);
+    if (email === adminEmail) return json(res, { error: 'This email is reserved.' }, 409);
+    const credentials = await passwordHash(password);
+    const account = baseAccount({ id: id(), username, email, data: { preferences: { language: ['en','fr','es','de','pt','hi','zh','it'].includes(req.body?.language) ? req.body.language : 'en', theme: 'dark' } } });
+    await pool.query(
+      'INSERT INTO app_accounts (id, username, email, role, status, password_salt, password_hash, account_data, created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9)',
+      [account.id, username, email, 'user', 'approved', credentials.salt, credentials.hash, JSON.stringify(account), account.createdAt],
+    );
+    const token = crypto.randomBytes(32).toString('base64url');
+    await pool.query("INSERT INTO app_sessions (token_hash, account_id, expires_at) VALUES ($1,$2,NOW() + ($3 * INTERVAL '1 hour'))", [hashToken(token), account.id, sessionHours]);
+    return json(res, { token, account });
   } catch (error) {
-    console.error("WebSIM account API error:", error?.message || error);
-    return appJson({ error: "Service temporarily unavailable." }, 500);
+    if (error.code === '23505') return json(res, { error: 'Email or username is already in use.' }, 409);
+    next(error);
   }
+});
+
+app.post('/api/auth/login', authRateLimit, async (req, res, next) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const password = String(req.body?.password || '');
+    if (!emailPattern.test(email) || !password || password.length > 200) return json(res, { error: 'Email or password is incorrect.' }, 401);
+    const adminEmail = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+    let row = (await pool.query('SELECT * FROM app_accounts WHERE email = $1', [email])).rows[0];
+    if (email === adminEmail && process.env.ADMIN_PASSWORD_HASH) {
+      if (!await passwordMatches(password, process.env.ADMIN_PASSWORD_SALT, process.env.ADMIN_PASSWORD_HASH)) {
+        return json(res, { error: 'Email or password is incorrect.' }, 401);
+      }
+      if (!row) {
+        const credentials = await passwordHash(password, process.env.ADMIN_PASSWORD_SALT);
+        const data = baseAccount({ id: id(), username: 'Admin-' + id().slice(0, 8), email, role: 'admin' });
+        row = (await pool.query(
+          'INSERT INTO app_accounts (id,username,email,role,status,password_salt,password_hash,account_data,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9) RETURNING *',
+          [data.id,data.username,email,'admin','approved',credentials.salt,credentials.hash,JSON.stringify(data),data.createdAt],
+        )).rows[0];
+      } else if (row.role !== 'admin') {
+        return json(res, { error: 'Admin account configuration conflict.' }, 503);
+      }
+    } else if (!row || row.role === 'admin' || !await passwordMatches(password, row.password_salt, row.password_hash)) {
+      return json(res, { error: 'Email or password is incorrect.' }, 401);
+    }
+    if (row.status !== 'approved') return json(res, { error: 'This account is not active.' }, 403);
+    const token = crypto.randomBytes(32).toString('base64url');
+    await pool.query("INSERT INTO app_sessions (token_hash, account_id, expires_at) VALUES ($1,$2,NOW() + ($3 * INTERVAL '1 hour'))", [hashToken(token), row.id, sessionHours]);
+    return json(res, { token, account: await getAccount(row) });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/auth/logout', requireAuth, async (req, res, next) => {
+  try {
+    const token = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+    await pool.query('DELETE FROM app_sessions WHERE token_hash = $1', [hashToken(token)]);
+    return json(res, { ok: true });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/account', requireAuth, async (req, res, next) => {
+  try { return json(res, { account: await getAccount(req.account) }); }
+  catch (error) { next(error); }
+});
+
+app.put('/api/account', requireAuth, async (req, res, next) => {
+  try {
+    const current = req.account.account_data || {};
+    const preferences = req.body?.preferences;
+    if (!preferences || typeof preferences !== 'object') return json(res, { error: 'Invalid account update.' }, 400);
+    const data = { ...current, preferences: {
+      language: ['en','fr','es','de','pt','hi','zh','it'].includes(preferences.language) ? preferences.language : current.preferences?.language || 'en',
+      theme: ['dark','light'].includes(preferences.theme) ? preferences.theme : current.preferences?.theme || 'dark',
+    } };
+    const result = await pool.query('UPDATE app_accounts SET account_data=$1::jsonb, revision=revision+1 WHERE id=$2 RETURNING *', [JSON.stringify(data), req.account.id]);
+    return json(res, { account: await getAccount(result.rows[0]) });
+  } catch (error) { next(error); }
+});
+
+app.put('/api/admin/account', requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const targetId = String(req.body?.id || '');
+    const row = (await pool.query('SELECT * FROM app_accounts WHERE id=$1 FOR UPDATE', [targetId])).rows[0];
+    if (!row) return json(res, { error: 'Account not found.' }, 404);
+    const wallet = req.body?.wallet;
+    const status = String(req.body?.status || row.status);
+    if (!wallet || !Number.isFinite(Number(wallet.deposit)) || !Number.isFinite(Number(wallet.earnings)) || Number(wallet.deposit) < 0 || Number(wallet.earnings) < 0 || !['approved','blocked','pending','rejected'].includes(status)) {
+      return json(res, { error: 'Enter valid non-negative balances and account status.' }, 400);
+    }
+    const data = row.account_data || {};
+    data.wallet = { deposit: Number(wallet.deposit), earnings: Number(wallet.earnings) };
+    if (Array.isArray(req.body.transactions)) data.transactions = req.body.transactions.slice(0, 2000);
+    const updated = (await pool.query('UPDATE app_accounts SET account_data=$1::jsonb,status=$2,revision=revision+1 WHERE id=$3 RETURNING *', [JSON.stringify(data),status,targetId])).rows[0];
+    return json(res, { account: await getAccount(updated) });
+  } catch (error) { next(error); }
+});
+
+app.get('/api/deposit-addresses', requireAuth, (req, res) => {
+  if (process.env.ENABLE_CRYPTO_DEPOSITS !== 'true' && req.account.role !== 'admin') return json(res, { error: 'Crypto deposits are temporarily disabled.' }, 503);
+  const addresses = getDepositAddresses();
+  if (Object.values(addresses).some((value) => !value)) return json(res, { error: 'Deposit service is not fully configured.' }, 503);
+  return json(res, { addresses });
+});
+
+app.post('/api/deposits', requireAuth, async (req, res, next) => {
+  if (process.env.ENABLE_CRYPTO_DEPOSITS !== 'true') return json(res, { error: 'Crypto deposits are temporarily disabled.' }, 503);
+  try {
+    const network = String(req.body?.network || '');
+    const config = networks[network];
+    const rawAmount = Number(req.body?.amount);
+    const amount = Number.isFinite(rawAmount) ? Number(rawAmount.toFixed(2)) : NaN;
+    const txHash = safeTxHash(network, req.body?.txHash);
+    const address = getDepositAddresses()[network];
+    if (!config || !Number.isFinite(amount) || amount <= 0 || amount > 1_000_000_000 || !txHash || !address) {
+      return json(res, { error: 'Enter a valid USD amount, network and transaction hash.' }, 400);
+    }
+    if (String(req.body?.depositAddress || '') !== address) return json(res, { error: 'The deposit address changed. Reopen the request and use the current address.' }, 409);
+    const requestId = id();
+    const transactionId = id();
+    const createdAt = now();
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        'INSERT INTO deposit_requests (id,account_id,network,asset,amount,amount_currency,deposit_address,tx_hash,status,transaction_id,created_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
+        [requestId,req.account.id,network,config.asset,amount,'USD',address,txHash,'pending',transactionId,createdAt],
+      );
+      const data = req.account.account_data || {};
+      data.transactions ||= [];
+      data.transactions.unshift({ id: transactionId, type: 'deposit', amount: 0, network, status: 'pending', date: createdAt, requestId });
+      await client.query('UPDATE app_accounts SET account_data=$1::jsonb,revision=revision+1 WHERE id=$2', [JSON.stringify(data), req.account.id]);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      if (error.code === '23505') return json(res, { error: 'This transaction hash has already been submitted.' }, 409);
+      throw error;
+    } finally { client.release(); }
+    const refreshed = (await pool.query('SELECT * FROM app_accounts WHERE id=$1', [req.account.id])).rows[0];
+    return json(res, { account: await getAccount(refreshed) }, 201);
+  } catch (error) { next(error); }
+});
+
+app.get('/api/admin/accounts', requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const [accounts, deposits] = await Promise.all([
+      pool.query('SELECT * FROM app_accounts ORDER BY created_at DESC LIMIT 500'),
+      pool.query('SELECT * FROM deposit_requests ORDER BY created_at DESC LIMIT 1000'),
+    ]);
+    const byAccount = new Map();
+    for (const row of deposits.rows) {
+      const list = byAccount.get(row.account_id) || [];
+      list.push(depositView(row));
+      byAccount.set(row.account_id, list);
+    }
+    return json(res, { accounts: accounts.rows.map((row) => publicAccount(row, byAccount.get(row.id) || [])) });
+  } catch (error) { next(error); }
+});
+
+app.post('/api/admin/deposits/:id/approve', requireAuth, requireAdmin, async (req, res, next) => {
+  const rawCreditUsdt = Number(req.body?.creditUsdt);
+  const creditUsdt = Number.isFinite(rawCreditUsdt) ? Number(rawCreditUsdt.toFixed(8)) : NaN;
+  if (!Number.isFinite(creditUsdt) || creditUsdt <= 0 || creditUsdt > 1_000_000_000) return json(res, { error: 'Enter the verified USDT amount to credit.' }, 400);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const deposit = (await client.query('SELECT * FROM deposit_requests WHERE id=$1 FOR UPDATE', [req.params.id])).rows[0];
+    if (!deposit || deposit.status !== 'pending') { await client.query('ROLLBACK'); return json(res, { error: 'Deposit not found or already reviewed.' }, 409); }
+    const accountRow = (await client.query('SELECT * FROM app_accounts WHERE id=$1 FOR UPDATE', [deposit.account_id])).rows[0];
+    if (!accountRow || accountRow.status !== 'approved') { await client.query('ROLLBACK'); return json(res, { error: 'Account is not active.' }, 409); }
+    const data = accountRow.account_data || {};
+    data.wallet ||= { deposit: 0, earnings: 0 };
+    data.wallet.deposit = Number(data.wallet.deposit || 0) + creditUsdt;
+    data.transactions ||= [];
+    const reviewedAt = now();
+    const tx = data.transactions.find((item) => item.id === deposit.transaction_id);
+    if (tx) { tx.status = 'confirmed'; tx.amount = creditUsdt; tx.creditedUsdt = creditUsdt; tx.reviewedAt = reviewedAt; }
+    await client.query('UPDATE app_accounts SET account_data=$1::jsonb,revision=revision+1 WHERE id=$2', [JSON.stringify(data),accountRow.id]);
+    await client.query('UPDATE deposit_requests SET status=$1,credit_usdt=$2,reviewed_at=$3,reviewed_by=$4 WHERE id=$5', ['confirmed',creditUsdt,reviewedAt,req.account.id,deposit.id]);
+    await client.query('INSERT INTO deposit_ledger (id,account_id,deposit_id,credit_usdt,balance_after_usdt,created_at,created_by) VALUES ($1,$2,$3,$4,$5,$6,$7)', [id(),accountRow.id,deposit.id,creditUsdt,Number(data.wallet.deposit),reviewedAt,req.account.id]);
+    await client.query('COMMIT');
+    const updated = (await pool.query('SELECT * FROM app_accounts WHERE id=$1', [accountRow.id])).rows[0];
+    return json(res, { account: await getAccount(updated), depositId: deposit.id });
+  } catch (error) { await client.query('ROLLBACK').catch(() => {}); next(error); }
+  finally { client.release(); }
+});
+
+app.post('/api/admin/deposits/:id/reject', requireAuth, requireAdmin, async (req, res, next) => {
+  try {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const deposit = (await client.query('SELECT * FROM deposit_requests WHERE id=$1 FOR UPDATE', [req.params.id])).rows[0];
+      if (!deposit || deposit.status !== 'pending') { await client.query('ROLLBACK'); return json(res, { error: 'Deposit not found or already reviewed.' }, 409); }
+      const accountRow = (await client.query('SELECT * FROM app_accounts WHERE id=$1 FOR UPDATE', [deposit.account_id])).rows[0];
+      const data = accountRow?.account_data || {};
+      const tx = (data.transactions || []).find((item) => item.id === deposit.transaction_id);
+      const reviewedAt = now();
+      if (tx) { tx.status = 'rejected'; tx.reviewedAt = reviewedAt; }
+      await client.query('UPDATE app_accounts SET account_data=$1::jsonb,revision=revision+1 WHERE id=$2', [JSON.stringify(data),deposit.account_id]);
+      await client.query('UPDATE deposit_requests SET status=$1,reviewed_at=$2,reviewed_by=$3 WHERE id=$4', ['rejected',reviewedAt,req.account.id,deposit.id]);
+      await client.query('COMMIT');
+      const updated = (await pool.query('SELECT * FROM app_accounts WHERE id=$1', [deposit.account_id])).rows[0];
+      return json(res, { account: await getAccount(updated), depositId: deposit.id });
+    } catch (error) { await client.query('ROLLBACK'); throw error; }
+    finally { client.release(); }
+  } catch (error) { next(error); }
+});
+
+app.get('/api/admin/deposit-addresses', requireAuth, requireAdmin, (req, res) => json(res, { addresses: getDepositAddresses() }));
+app.post('/api/investments/mark', requireAuth, async (req, res, next) => {
+  try { return json(res, { account: await getAccount(req.account) }); }
+  catch (error) { next(error); }
+});
+
+app.use('/api', (req, res) => json(res, { error: 'This operation is not available on the Render backend yet.' }, 501));
+app.use(express.static(root, { index: 'index.html', maxAge: '1h' }));
+app.get('*', (req, res) => res.sendFile(path.join(root, 'index.html')));
+app.use((error, req, res, next) => {
+  console.error('API error:', error?.message || error);
+  if (res.headersSent) return next(error);
+  return json(res, { error: 'Service temporarily unavailable.' }, 500);
+});
+
+const schema = `
+  CREATE TABLE IF NOT EXISTS app_accounts (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, email TEXT NOT NULL UNIQUE, role TEXT NOT NULL CHECK (role IN ('user','admin')), status TEXT NOT NULL DEFAULT 'approved', password_salt TEXT NOT NULL, password_hash TEXT NOT NULL, account_data JSONB NOT NULL, created_at BIGINT NOT NULL, revision INTEGER NOT NULL DEFAULT 1);
+  CREATE TABLE IF NOT EXISTS app_sessions (token_hash TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES app_accounts(id) ON DELETE CASCADE, expires_at TIMESTAMPTZ NOT NULL);
+  CREATE INDEX IF NOT EXISTS app_sessions_expiry ON app_sessions(expires_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS app_accounts_username_lower ON app_accounts (LOWER(username));
+  CREATE TABLE IF NOT EXISTS deposit_requests (id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES app_accounts(id) ON DELETE CASCADE, network TEXT NOT NULL, asset TEXT NOT NULL, amount NUMERIC(24,8) NOT NULL CHECK (amount > 0), amount_currency TEXT NOT NULL DEFAULT 'crypto' CHECK (amount_currency IN ('crypto','USD')), deposit_address TEXT NOT NULL, tx_hash TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('pending','confirmed','rejected')), credit_usdt NUMERIC(24,8), transaction_id TEXT NOT NULL, created_at BIGINT NOT NULL, reviewed_at BIGINT, reviewed_by TEXT REFERENCES app_accounts(id), UNIQUE(network,tx_hash));
+  CREATE TABLE IF NOT EXISTS deposit_ledger (id TEXT PRIMARY KEY, account_id TEXT NOT NULL REFERENCES app_accounts(id) ON DELETE CASCADE, deposit_id TEXT NOT NULL UNIQUE REFERENCES deposit_requests(id), credit_usdt NUMERIC(24,8) NOT NULL CHECK (credit_usdt > 0), balance_after_usdt NUMERIC(24,8) NOT NULL, created_at BIGINT NOT NULL, created_by TEXT NOT NULL REFERENCES app_accounts(id));
+`;
+
+async function start() {
+  for (const name of ['DATABASE_URL','ADMIN_EMAIL','ADMIN_PASSWORD_SALT','ADMIN_PASSWORD_HASH', ...Object.values(networks).map((item) => item.env)]) {
+    if (!process.env[name]) throw new Error('Missing required environment variable: ' + name);
+  }
+  if (process.env.ADMIN_PASSWORD_SALT.length < 16 || !/^[a-f0-9]{128}$/i.test(process.env.ADMIN_PASSWORD_HASH)) throw new Error('ADMIN_PASSWORD_SALT/HASH must be a 16+ char salt and 64-byte scrypt hash in hex.');
+  await pool.query(schema);
+  await pool.query("ALTER TABLE deposit_requests ADD COLUMN IF NOT EXISTS amount_currency TEXT NOT NULL DEFAULT 'crypto' CHECK (amount_currency IN ('crypto','USD'))");
+  const addresses = getDepositAddresses();
+  if (!/^0x[a-fA-F0-9]{40}$/.test(addresses.bep20)) throw new Error('DEPOSIT_ADDRESS_BNB_BEP20 is not a valid BNB Smart Chain address.');
+  if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(addresses.trc20)) throw new Error('DEPOSIT_ADDRESS_USDT_TRC20 is not a valid TRON address.');
+  if (!/^bc1[ac-hj-np-z02-9]{11,71}$/i.test(addresses.bitcoin)) throw new Error('DEPOSIT_ADDRESS_BTC is not a valid bech32 Bitcoin address.');
+  await pool.query('DELETE FROM app_sessions WHERE expires_at <= NOW()');
+  app.listen(port, () => console.log('Custody API listening on port ' + port));
 }
 
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const accountResponse = await appAccountApi(request, env, url);
-    if (accountResponse) return accountResponse;
-    if (request.method !== "GET") return new Response("Not found", { status: 404 });
-    if (url.pathname === "/api/asset-history") {
-      if (cachedHistory && Date.now() - historyAt < 20_000) {
-        return Response.json(cachedHistory, { headers: { "Cache-Control": "no-store" } });
-      }
-      if (!historyInFlight) {
-        historyInFlight = loadAssetHistory().then((data) => {
-          cachedHistory = data;
-          historyAt = Date.now();
-          return cachedHistory;
-        }).finally(() => { historyInFlight = null; });
-      }
-      return Response.json(await historyInFlight, { headers: { "Cache-Control": "no-store" } });
-    }
-    if (url.pathname !== "/api/asset-prices") return new Response("Not found", { status: 404 });
-    if (cachedQuotes && Date.now() - cachedAt < 60_000) {
-      return Response.json(cachedQuotes, { headers: { "Cache-Control": "no-store" } });
-    }
-    if (!refreshInFlight) {
-      refreshInFlight = loadQuotes().then((data) => {
-        if (Object.keys(data.quotes).length) {
-          cachedQuotes = {
-            quotes: { ...(cachedQuotes?.quotes || {}), ...data.quotes },
-            fetchedAt: data.fetchedAt,
-          };
-          cachedAt = Date.now();
-        }
-        return cachedQuotes || data;
-      }).finally(() => { refreshInFlight = null; });
-    }
-    const data = await refreshInFlight;
-    return Response.json(data, { headers: { "Cache-Control": "no-store" } });
-  },
-};
+start().catch((error) => {
+  console.error('Custody API failed to start:', error.message);
+  process.exit(1);
+});
