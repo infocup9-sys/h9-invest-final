@@ -1,1 +1,23 @@
+const express = require('express');
+const { Pool } = require('pg');
+
+const app = express();
+app.use(express.json());
+
+// Connessione al database PostgreSQL di Render
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
+
+// Controllo base per vedere se il server risponde
+app.get('/', (req, res) => {
+  res.status(200).send('Custody API is running!');
+});
+
+// Avvio del server sulla porta assegnata da Render (o 3000 di default)
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server in ascolto sulla porta ${PORT}`);
+});
 
