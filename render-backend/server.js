@@ -16,7 +16,7 @@ const pool = new Pool({
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
 });
-const port = Number(process.env.PORT || 3000);
+const port = Number(process.env.PORT || 10000);
 const sessionHours = Math.max(1, Math.min(720, Number(process.env.SESSION_TTL_HOURS) || 168));
 const networks = {
   bep20: { asset: 'BNB', label: 'BNB · BNB Smart Chain', env: 'DEPOSIT_ADDRESS_BNB_BEP20' },
@@ -390,7 +390,9 @@ async function start() {
   if (!/^T[1-9A-HJ-NP-Za-km-z]{33}$/.test(addresses.trc20)) throw new Error('DEPOSIT_ADDRESS_USDT_TRC20 is not a valid TRON address.');
   if (!/^bc1[ac-hj-np-z02-9]{11,71}$/i.test(addresses.bitcoin)) throw new Error('DEPOSIT_ADDRESS_BTC is not a valid bech32 Bitcoin address.');
   await pool.query('DELETE FROM app_sessions WHERE expires_at <= NOW()');
-  app.listen(port, () => console.log('Custody API listening on port ' + port));
+  
+  // MODIFICA APPLICATA QUI SOTTO: Aggiunto '0.0.0.0' e porta di fallback a 10000
+  app.listen(port, '0.0.0.0', () => console.log('Custody API listening on port ' + port));
 }
 
 start().catch((error) => {
