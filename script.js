@@ -1,5 +1,6 @@
 const USE_MOCK_BACKEND = location.hostname.includes('websim');
-const mockApiRequest = USE_MOCK_BACKEND ? (await import('./mock-api.js')).mockApiRequest : null;
+const mockApi = USE_MOCK_BACKEND ? await import('./mock-api.js') : null;
+const mockApiRequest = mockApi?.mockApiRequest || null;
 import { PLANS, CUSTOM_ASSETS, calendarDaysBetween } from './investment-model.js';
 import { DAILY_PRIZES, REWARDS } from './rewards-model.js';
 import { translatePage, translateText } from './localization.js';
@@ -53,8 +54,90 @@ if (USE_MOCK_BACKEND) {
   $('save-deposit-addresses').textContent = 'Save deposit addresses';
 }
 
+let mockAccessToken = '';
+
+async function websimAccountRequest(path, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
+  if (options.body) headers.set('Content-Type', 'application/json');
+  const route = path.replace(/^\/api/, '/api/app');
+  const response = await fetch(route, { ...options, headers });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || 'Service temporarily unavailable.');
+  return result;
+}
+
+async function hydrateWebsimAccounts(account, password = '') {
+  let list = [account];
+  if (account.role === 'admin') {
+    const { accounts: cloudAccounts } = await websimAccountRequest('/api/admin/accounts');
+    list = cloudAccounts;
+  }
+  mockAccessToken = await mockApi.hydrateMockAccounts(list, account.id, password, mockAccessToken);
+}
+
 async function apiRequest(path, options = {}) {
-  if (USE_MOCK_BACKEND) return mockApiRequest(path, options, accessToken);
+  if (USE_MOCK_BACKEND) {
+    const body = options.body ? JSON.parse(options.body) : {};
+    if (path === '/api/auth/register' || path === '/api/auth/login') {
+      const result = await websimAccountRequest(path, options);
+      accessToken = result.token;
+      sessionStorage.setItem(SESSION_KEY, accessToken);
+      await hydrateWebsimAccounts(result.account, body.password || '');
+      return result;
+    }
+    if (path === '/api/auth/logout') {
+      const result = await websimAccountRequest(path, options);
+      if (mockAccessToken) await mockApiRequest(path, options, mockAccessToken).catch(() => {});
+      accessToken = '';
+      mockAccessToken = '';
+      sessionStorage.removeItem(SESSION_KEY);
+      return result;
+    }
+    if (path === '/api/account' && options.method !== 'PUT') {
+      const result = await websimAccountRequest(path, options);
+      await hydrateWebsimAccounts(result.account);
+      return result;
+    }
+    if (path === '/api/admin/accounts' && (!options.method || options.method === 'GET')) {
+      const result = await websimAccountRequest(path, options);
+      const own = result.accounts.find((item) => item.id === current?.id);
+      if (own) mockAccessToken = await mockApi.hydrateMockAccounts(result.accounts, own.id, '', mockAccessToken);
+      return result;
+    }
+    if (path === '/api/account' || path === '/api/admin/account' ||
+        (path === '/api/admin/accounts' && options.method === 'DELETE')) {
+      const result = await websimAccountRequest(path, options);
+      if (result.account) await hydrateWebsimAccounts(result.account);
+      return result;
+    }
+    if (path === '/api/auth/password' && options.method === 'PUT') {
+      const result = await websimAccountRequest(path, options);
+      await mockApiRequest(path, options, mockAccessToken);
+      return result;
+    }
+    if (path === '/api/auth/password-reset/request' || path === '/api/auth/password-reset/confirm' || path === '/api/admin/recovery-key') {
+      return websimAccountRequest(path, options);
+    }
+
+    const { account: cloudAccount } = await websimAccountRequest('/api/account');
+    let cloudAccounts = [cloudAccount];
+    if (cloudAccount.role === 'admin' && path.startsWith('/api/admin/')) {
+      cloudAccounts = (await websimAccountRequest('/api/admin/accounts')).accounts;
+    }
+    mockAccessToken = await mockApi.hydrateMockAccounts(cloudAccounts, cloudAccount.id, '', mockAccessToken);
+    const result = await mockApiRequest(path, options, mockAccessToken);
+    if (result?.account) {
+      const target = cloudAccounts.find((item) => item.id === result.account.id);
+      const adminEdit = result.account.id !== cloudAccount.id;
+      const saved = await websimAccountRequest(adminEdit ? '/api/admin/account' : '/api/account', {
+        method: 'PUT',
+        body: JSON.stringify({ account: result.account, expectedRevision: target?.revision ?? cloudAccount.revision }),
+      });
+      result.account = saved.account;
+    }
+    return result;
+  }
   const headers = new Headers(options.headers || {});
   if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
   if (options.body) headers.set('Content-Type', 'application/json');

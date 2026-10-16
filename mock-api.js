@@ -237,6 +237,31 @@ function issueSession(accountId) {
   return token;
 }
 
+export async function hydrateMockAccounts(remoteAccounts, currentId, password = '', currentToken = '') {
+  const cached = readAccounts();
+  const hydrated = await Promise.all(remoteAccounts.map(async (remote) => {
+    const previous = cached.find((item) => item.id === remote.id);
+    const account = {
+      ...previous,
+      ...remote,
+      role: remote.role,
+      platformAdmin: remote.role === 'admin',
+      salt: previous?.salt || makeId(),
+      passwordHash: previous?.passwordHash || '',
+    };
+    if (remote.id === currentId && password) {
+      account.salt = makeId();
+      account.passwordHash = await passwordDigest(password, account.salt);
+    }
+    return account;
+  }));
+  const remoteIds = new Set(hydrated.map((account) => account.id));
+  const accounts = [...cached.filter((account) => !remoteIds.has(account.id)), ...hydrated];
+  saveAccounts(accounts);
+  if (currentToken && readSessions()[currentToken] === currentId) return currentToken;
+  return issueSession(currentId);
+}
+
 function getSessionAccount(accessToken, options) {
   const headers = new Headers(options.headers || {});
   const authorization = headers.get('Authorization') || (accessToken ? `Bearer ${accessToken}` : '');
